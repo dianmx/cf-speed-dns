@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DNSPod DNS 更新器
+DNSPod DNS 更新器（调试修复版）
 获取优选 IP 并更新 DNSPod DNS 记录
 """
 
@@ -30,6 +30,9 @@ PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN")
 # 默认超时时间（秒）
 DEFAULT_TIMEOUT = 30
 
+# 调试开关：True 时打印 API 原始返回，测试完可设为 False
+DEBUG = True
+
 
 class TencentCloudSigner:
     """腾讯云 API 签名类"""
@@ -43,13 +46,11 @@ class TencentCloudSigner:
         self.version = "2021-03-23"
 
     def _get_signature_key(self, key: str, date_stamp: str, service_name: str) -> bytes:
-        """生成签名密钥"""
         k_date = hmac.new(f"TC3{key}".encode('utf-8'), date_stamp.encode('utf-8'), hashlib.sha256).digest()
         k_service = hmac.new(k_date, service_name.encode('utf-8'), hashlib.sha256).digest()
         return hmac.new(k_service, b'tc3_request', hashlib.sha256).digest()
 
     def sign(self, action: str, payload: Dict[str, Any]) -> Dict[str, str]:
-        """生成请求头"""
         timestamp = int(time.time())
         date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -111,7 +112,6 @@ class DnsPodClient:
         self.session = requests.Session()
 
     def _call_api(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """调用腾讯云 API"""
         headers = self.signer.sign(action, payload)
         try:
             response = self.session.post(
@@ -123,6 +123,8 @@ class DnsPodClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
+            if DEBUG:
+                print(f"[DEBUG] API {action} 请求异常: {e}")
             return {
                 "Response": {
                     "Error": {"Code": "RequestError", "Message": str(e)},
@@ -131,7 +133,6 @@ class DnsPodClient:
             }
 
     def get_record(self, domain: str, length: int, sub_domain: str, record_type: str) -> Dict[str, Any]:
-        """获取 DNS 记录列表"""
         payload = {
             "Domain": domain,
             "Subdomain": sub_domain,
@@ -140,6 +141,13 @@ class DnsPodClient:
         }
 
         resp = self._call_api("DescribeRecordList", payload)
+
+        if DEBUG:
+            print("=" * 60)
+            print("[DEBUG] DescribeRecordList 请求参数:", json.dumps(payload, ensure_ascii=False))
+            print("[DEBUG] DescribeRecordList 原始返回:", json.dumps(resp, ensure_ascii=False, indent=2))
+            print("=" * 60)
+
         response = resp.get("Response", {})
 
         result = {
@@ -147,20 +155,34 @@ class DnsPodClient:
             "data": {"records": [], "domain": {}}
         }
 
-        if "Error" not in response:
-            for record in response.get('RecordList', []):
-                formatted = {k.lower(): v for k, v in record.items()}
-                formatted["id"] = record.get('RecordId')
-                result["data"]["records"].append(formatted)
+        if "Error" in response:
+            # 不再静默吞错，把错误暴露出来
+            err = response["Error"]
+            print(f"[ERROR] DescribeRecordList 失败: Code={err.get('Code')}, Message={err.get('Message')}")
+            result["code"] = -1
+            result["error"] = err
+            return result
+
+        record_list = response.get('RecordList', [])
+        if DEBUG:
+            print(f"[DEBUG] RecordList 条数: {len(record_list)}")
+            if record_list:
+                print("[DEBUG] 第一条记录样例:", json.dumps(record_list[0], ensure_ascii=False, indent=2))
+
+        for record in record_list:
+            formatted = {k.lower(): v for k, v in record.items()}
+            formatted["id"] = record.get('RecordId')
+            result["data"]["records"].append(formatted)
 
         # 获取域名信息
         domain_info = self._call_api("DescribeDomain", {"Domain": domain})
+        if DEBUG:
+            print("[DEBUG] DescribeDomain 原始返回:", json.dumps(domain_info, ensure_ascii=False, indent=2))
         result["data"]["domain"]["grade"] = domain_info.get("Response", {}).get("DomainInfo", {}).get("Grade", "")
         return result
 
     def change_record(self, domain: str, record_id: int, sub_domain: str,
                       value: str, record_type: str = "A", line: str = "默认", ttl: int = 600) -> Dict[str, Any]:
-        """修改 DNS 记录"""
         payload = {
             "Domain": domain,
             "SubDomain": sub_domain,
@@ -172,6 +194,9 @@ class DnsPodClient:
         }
 
         resp = self._call_api("ModifyRecord", payload)
+        if DEBUG:
+            print("[DEBUG] ModifyRecord 原始返回:", json.dumps(resp, ensure_ascii=False, indent=2))
+
         response = resp.get("Response", {})
 
         if "Error" in response:
@@ -180,16 +205,6 @@ class DnsPodClient:
 
 
 def get_cf_speed_test_ip(timeout=10, max_retries=5):
-    """
-    获取 Cloudflare 优选 IP
-
-    Args:
-        timeout: 单次请求超时时间
-        max_retries: 最大重试次数
-
-    Returns:
-        优选 IP 字符串，失败返回 None
-    """
     for attempt in range(max_retries):
         try:
             response = requests.get(
@@ -207,13 +222,7 @@ def get_cf_speed_test_ip(timeout=10, max_retries=5):
 
 def build_info(client: DnsPodClient) -> List[Dict[str, Any]]:
     """
-    构建 DNS 记录信息
-
-    Args:
-        client: DnsPodClient 实例
-
-    Returns:
-        记录信息列表，失败返回空列表
+    构建 DNS 记录信息（调试版：先不过滤线路，看到真实数据）
     """
     def_info = []
     current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -222,11 +231,30 @@ def build_info(client: DnsPodClient) -> List[Dict[str, Any]]:
         ret = client.get_record(DOMAIN, 100, SUB_DOMAIN, 'A')
         records = ret.get("data", {}).get("records", [])
 
+        print(f"[DEBUG] build_info 拿到记录数: {len(records)}")
+
+        # 调试阶段：先打印每条记录的 line 和 value，不过滤
+        for i, record in enumerate(records):
+            print(f"[DEBUG] 记录[{i}] id={record.get('id')} "
+                  f"name={record.get('name')} "
+                  f"line={record.get('line')!r} "
+                  f"value={record.get('value')} "
+                  f"status={record.get('status')}")
+
+        # 调试阶段：暂时收集所有记录，方便你确认哪条是默认线路
+        # 确认后把下面的条件改回 record.get("line") == "默认"
         for record in records:
-            if record.get("line") == "默认":
+            line_val = record.get("line")
+            # 兼容 "默认" 和 "Default"
+            if line_val in ("默认", "Default"):
                 def_info.append({"recordId": record.get("id"), "value": record.get("value")})
 
-        print(f"build_info success: ---- Time: {current_time} ---- ip：{def_info}")
+        # 如果按默认线路还是没筛到，调试阶段先退化为取第一条，避免空跑
+        if not def_info and records:
+            print("[WARN] 没有线路为 '默认'/'Default' 的记录，调试阶段临时取第一条")
+            def_info.append({"recordId": records[0].get("id"), "value": records[0].get("value")})
+
+        print(f"build_info done: ---- Time: {current_time} ---- 选中记录：{def_info}")
     except Exception as e:
         traceback.print_exc()
         print(f"build_info ERROR: ---- Time: {current_time} ---- MESSAGE: {e}")
@@ -235,23 +263,17 @@ def build_info(client: DnsPodClient) -> List[Dict[str, Any]]:
 
 
 def change_dns(client: DnsPodClient, record_id: int, cf_ip: str) -> str:
-    """
-    更新 DNS 记录
-
-    Args:
-        client: DnsPodClient 实例
-        record_id: 记录 ID
-        cf_ip: 新的 IP 地址
-
-    Returns:
-        操作结果字符串
-    """
     current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
     try:
-        client.change_record(DOMAIN, record_id, SUB_DOMAIN, cf_ip, "A", "默认", 600)
-        print(f"change_dns success: ---- Time: {current_time} ---- ip：{cf_ip}")
-        return f"ip:{cf_ip} 解析 {SUB_DOMAIN}.{DOMAIN} 成功"
+        result = client.change_record(DOMAIN, record_id, SUB_DOMAIN, cf_ip, "A", "默认", 600)
+        if result.get("code") == 0:
+            print(f"change_dns success: ---- Time: {current_time} ---- ip：{cf_ip}")
+            return f"ip:{cf_ip} 解析 {SUB_DOMAIN}.{DOMAIN} 成功"
+        else:
+            msg = result.get("message")
+            print(f"change_dns failed: ---- Time: {current_time} ---- ip：{cf_ip} ---- msg: {msg}")
+            return f"ip:{cf_ip} 解析 {SUB_DOMAIN}.{DOMAIN} 失败: {msg}"
     except Exception as e:
         traceback.print_exc()
         print(f"change_dns ERROR: ---- Time: {current_time} ---- MESSAGE: {e}")
@@ -259,12 +281,6 @@ def change_dns(client: DnsPodClient, record_id: int, cf_ip: str) -> str:
 
 
 def pushplus(content: str):
-    """
-    发送 PushPlus 消息推送
-
-    Args:
-        content: 消息内容
-    """
     if not PUSHPLUS_TOKEN:
         print("PUSHPLUS_TOKEN 未设置，跳过消息推送")
         return
@@ -287,22 +303,19 @@ def pushplus(content: str):
 
 
 def main():
-    """主函数"""
-    # 检查必要的环境变量
     if not all([DOMAIN, SUB_DOMAIN, SECRETID, SECRETKEY]):
         print("错误: 缺少必要的环境变量 (DOMAIN, SUB_DOMAIN, SECRETID, SECRETKEY)")
         return
 
-    # 初始化 DNSPod 客户端
+    print(f"[INFO] DOMAIN={DOMAIN}, SUB_DOMAIN={SUB_DOMAIN}")
+
     client = DnsPodClient(SECRETID, SECRETKEY)
 
-    # 获取 DNS 记录
     info = build_info(client)
     if not info:
         print(f"错误: 未找到 {SUB_DOMAIN}.{DOMAIN} 的 DNS 记录")
         return
 
-    # 获取最新优选 IP
     ip_addresses_str = get_cf_speed_test_ip()
     if not ip_addresses_str:
         print("错误: 无法获取优选 IP")
@@ -313,18 +326,15 @@ def main():
         print("错误: 未解析到有效 IP 地址")
         return
 
-    # 检查记录数量是否足够
     if len(ip_addresses) > len(info):
         print(f"警告: IP 数量({len(ip_addresses)})超过 DNS 记录数量({len(info)})，只更新前 {len(info)} 个")
         ip_addresses = ip_addresses[:len(info)]
 
-    # 更新 DNS 记录
     pushplus_content = []
     for index, ip_address in enumerate(ip_addresses):
         dns = change_dns(client, info[index]["recordId"], ip_address)
         pushplus_content.append(dns)
 
-    # 发送推送
     if pushplus_content:
         pushplus('\n'.join(pushplus_content))
 
